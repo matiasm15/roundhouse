@@ -3059,7 +3059,7 @@ impl Analyzer {
                     self.body_typer().analyze_method_body(&mut method.body, &mctx);
                 }
             }
-            self.harvest_one_model(model);
+            self.harvest_one_model(model, &app.schema);
         }
         drop(_typing_models);
 
@@ -5736,7 +5736,7 @@ impl Analyzer {
         }
     }
 
-    fn harvest_one_model(&mut self, model: &Model) {
+    fn harvest_one_model(&mut self, model: &Model, schema: &crate::schema::Schema) {
         let class_id = &model.name;
         for (name, ty) in crate::lower::model_to_library::markers::readonly_attr_types(model) {
             self.classes.entry(class_id.clone()).or_default().instance_methods.insert(name, ty);
@@ -5803,12 +5803,46 @@ impl Analyzer {
             }
             Self::register_method_return(target, &method.name, ret.as_ref());
         }
+        self.harvest_model_aliases(model, schema);
+    }
+
+    /// A model's `alias new old` answers as what it copies: the lowering
+    /// gives the model that copy (`resolve_model_aliases`), so a caller
+    /// elsewhere in the app (`@goods_in.items` over
+    /// `alias items goods_in_items`) dispatches to it. An alias the
+    /// lowering refuses stays unknown.
+    fn harvest_model_aliases(&mut self, model: &Model, schema: &crate::schema::Schema) {
+        use crate::lower::model_to_library::{model_aliases, AliasSource};
+        let class_id = &model.name;
+        let aliases = {
+            let known = self.classes.get(class_id).map(|c| &c.instance_methods);
+            model_aliases(model, schema, &|name| known.is_some_and(|m| m.contains_key(name)))
+        };
+        for alias in aliases {
+            if alias.redefined_later {
+                continue;
+            }
+            match alias.source {
+                None => {}
+                Some(AliasSource::Method(method)) => {
+                    let ret = self.method_return_ty(class_id, method);
+                    let target = &mut self.classes.entry(class_id.clone()).or_default().instance_methods;
+                    Self::register_method_return(target, &alias.new, ret.as_ref());
+                }
+                Some(AliasSource::Synthesized(name) | AliasSource::Inherited(name)) => {
+                    let target = &mut self.classes.entry(class_id.clone()).or_default().instance_methods;
+                    if let Some(ty) = target.get(&name).cloned() {
+                        target.insert(alias.new, ty);
+                    }
+                }
+            }
+        }
     }
 
     fn harvest_method_returns(&mut self, app: &App, harvest_tests: bool) {
         let returns_span = crate::timings::begin("harvest: returns");
         for model in &app.models {
-            self.harvest_one_model(model);
+            self.harvest_one_model(model, &app.schema);
         }
         // Each body's return is read on its own, so the reads run in
         // parallel; the registry is written afterwards, in source order.
