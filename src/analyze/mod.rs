@@ -856,7 +856,7 @@ impl Analyzer {
                 if entry.receiver != ReceiverContext::Instance {
                     continue;
                 }
-                let Some(ret) = catalog_instance_ty(entry, &model.name) else { continue };
+                let Some(kind) = entry.return_kind else { continue };
                 // Dispatch checks the model's own table before its includes and
                 // parent, so a seed here would hide an override that lives in
                 // an included module or a parent class (Ruby's ancestor order
@@ -876,6 +876,14 @@ impl Analyzer {
                 if inherited(entry.name) || (entry.name == "lock!" && inherited("reload")) {
                     continue;
                 }
+                // The shared runtime types `reload` and `lock!` as `() -> Base`,
+                // but in Rails they answer `self`: keep the receiver's own
+                // class so its model methods still resolve on the result.
+                let ret = if matches!(entry.name, "reload" | "lock!") {
+                    self_ty.clone()
+                } else {
+                    instantiate(kind)
+                };
                 cls.instance_methods.insert(Symbol::from(entry.name), ret);
             }
             // AR instance methods not (yet) in the catalog: dirty-tracking
@@ -5829,18 +5837,34 @@ impl Analyzer {
                 }
                 Some(AliasSource::Synthesized { name, item }) => Some(synthesized_reader_ty(item, &name)),
                 // The copy forwards to `old` on the model itself, so it
-                // answers the model's own entry for `old`, or, where the
-                // seed left none because an app base class redefines it
-                // (`def reload; super; end`), the cataloged method on this
-                // model, as `inherited_forwarder` requires one.
-                Some(AliasSource::Inherited(name)) => self
-                    .classes
-                    .get(class_id)
-                    .and_then(|cls| cls.instance_methods.get(&name).cloned())
-                    .or_else(|| {
-                        crate::catalog::lookup(name.as_str(), crate::catalog::ReceiverContext::Instance)
-                            .and_then(|entry| catalog_instance_ty(entry, class_id))
-                    }),
+                // answers what dispatch finds for `old` there: the
+                // model's own entry, or the nearest parent's (an app base
+                // class that redefines `reload`), substituted as the
+                // instance-method dispatch in `body::send` does: self as
+                // this model, and a model ancestor's own class as this
+                // model. Nothing yet when the parent's override has no
+                // return so far: a later harvest has it.
+                Some(AliasSource::Inherited(name)) => {
+                    let model_ty = Ty::Class { id: class_id.clone(), args: vec![].into() };
+                    let receiver_is_model = self.classes.get(class_id).is_some_and(|c| c.table.is_some());
+                    let mut current = Some(class_id);
+                    let mut found = None;
+                    for _ in 0..32 {
+                        let Some(cid) = current else { break };
+                        let Some(cls) = self.classes.get(cid) else { break };
+                        if let Some(ty) = cls.instance_methods.get(&name) {
+                            let ty = ty.subst_self(&model_ty);
+                            found = Some(if cid != class_id && cls.table.is_some() && receiver_is_model {
+                                ty.rebind_class(cid, class_id)
+                            } else {
+                                ty
+                            });
+                            break;
+                        }
+                        current = cls.parent.as_ref();
+                    }
+                    found
+                }
             };
             if let Some(ty) = ty {
                 self.classes.entry(class_id.clone()).or_default().instance_methods.insert(alias.new, ty);
@@ -8473,20 +8497,6 @@ fn descends_from_active_record(
         current = parent;
     }
     true
-}
-
-/// What a cataloged ActiveRecord instance method answers on `model`, or
-/// `None` when the catalog declares no return.
-fn catalog_instance_ty(entry: &crate::catalog::CatalogedMethod, model: &ClassId) -> Option<Ty> {
-    let kind = entry.return_kind?;
-    // The shared runtime types `reload` and `lock!` as `() -> Base`,
-    // but in Rails they answer `self`: keep the receiver's own
-    // class so its model methods still resolve on the result.
-    Some(if matches!(entry.name, "reload" | "lock!") {
-        Ty::Class { id: model.clone(), args: vec![].into() }
-    } else {
-        instantiate_return_kind(kind, model)
-    })
 }
 
 /// Instantiate a catalog [`crate::catalog::ReturnKind`] against a

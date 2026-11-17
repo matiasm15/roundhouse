@@ -115,6 +115,18 @@ fn an_alias_of_a_method_a_parent_redefines_answers_with_the_parents() {
 }
 
 #[test]
+fn an_alias_of_a_method_a_parent_overrides_answers_with_the_overrides_return() {
+    // The emitted `refresh` forwards to `reload`, which reaches the
+    // override: a String, not the record.
+    let application_record = "class ApplicationRecord < ActiveRecord::Base\n  primary_abstract_class\n\n  def reload\n    \"ready\"\n  end\nend\n";
+    let post = "class Post < ApplicationRecord\n  alias refresh reload\nend\n";
+    let string = failures_with(application_record, post, "  def show\n    @status = Post.find(params[:id]).refresh.upcase\n  end");
+    assert!(string.is_empty(), "{string:?}");
+    let record = failures_with(application_record, post, "  def show\n    @title = Post.find(params[:id]).refresh.title\n  end");
+    assert_eq!(record, vec!["String#title"]);
+}
+
+#[test]
 fn an_alias_keeps_the_association_reader_a_later_alias_replaces() {
     // `alias comments author` replaces the `comments` reader, but
     // `saved_comments` copied the association first and `remarks` copies
