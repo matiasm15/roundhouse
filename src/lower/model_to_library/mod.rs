@@ -2116,8 +2116,32 @@ fn resolve_model_aliases(
     let table = schema.tables.get(&model.table.0);
     for alias in model_aliases(model, schema, &|name| synthesized(name).is_some()) {
         let Some(source) = alias.source else {
-            let lazy_attribute = !includes_active_model_attributes(model) && attribute_api_names(model).contains(&alias.old);
-            push_alias_target_unresolved_gap(alias.span, model, &alias.old, &alias.new, table, lazy_attribute);
+            match alias.refusal {
+                Some(AliasRefusal::ReplacesAssociation) => push_alias_refused_gap(
+                    alias.span,
+                    format!(
+                        "alias {new} {old} on {model}: {new} is an association reader, and the methods \
+                         the association generates (its ids, cache and dependents) would call the \
+                         replacement",
+                        new = alias.new,
+                        old = alias.old,
+                        model = model.name.0
+                    ),
+                ),
+                Some(AliasRefusal::CopiesRefusedAlias) => push_alias_refused_gap(
+                    alias.span,
+                    format!(
+                        "alias {new} {old} on {model}: {old} names an alias refused above",
+                        new = alias.new,
+                        old = alias.old,
+                        model = model.name.0
+                    ),
+                ),
+                Some(AliasRefusal::Unresolved) | None => {
+                    let lazy_attribute = !includes_active_model_attributes(model) && attribute_api_names(model).contains(&alias.old);
+                    push_alias_target_unresolved_gap(alias.span, model, &alias.old, &alias.new, table, lazy_attribute);
+                }
+            }
             continue;
         };
         let mut copy = match source {
@@ -2171,9 +2195,25 @@ pub(crate) struct ModelAlias<'m> {
     pub span: Span,
     /// `None` when the alias is refused (`alias_target_unresolved`).
     pub source: Option<AliasSource<'m>>,
+    /// Why the alias is refused, when `source` is `None`.
+    pub refusal: Option<AliasRefusal>,
     /// A hand-written `def new` follows the alias line: that last
     /// definition stays, and the copy does not replace it.
     pub redefined_later: bool,
+}
+
+/// Why a model's `alias new old` is refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AliasRefusal {
+    /// `old` resolves to nothing the alias line can copy.
+    Unresolved,
+    /// `new` is one of the model's association readers. The methods the
+    /// association generates (`comment_ids`, its cache, its dependents)
+    /// call the reader by name, so a copy in its place breaks them.
+    ReplacesAssociation,
+    /// `old` is the `new` of an alias refused above: the model keeps the
+    /// name's earlier definition, which is not what Ruby's alias copies.
+    CopiesRefusedAlias,
 }
 
 /// Every `alias new old` of `model`'s body, in source order, resolved
@@ -2238,6 +2278,9 @@ pub(crate) fn model_aliases<'m>(
     // on, until a later hand-written redefinition — tracked by the arm
     // below — changes it again).
     let mut live: HashMap<Symbol, AliasSource<'m>> = HashMap::default();
+    // The `new` names of aliases refused for what they replace, whose
+    // earlier definition the model keeps.
+    let mut refused: HashSet<Symbol> = HashSet::default();
     let mut out = Vec::new();
 
     for (idx, item) in model.body.iter().enumerate() {
@@ -2260,7 +2303,23 @@ pub(crate) fn model_aliases<'m>(
                 }
             }
             ModelBodyItem::Alias { new, old, span, .. } => {
-                let source = if let Some(source) = live.get(old) {
+                let redefined_later = model.body[idx + 1..].iter().any(|later| matches!(
+                    later,
+                    ModelBodyItem::Method { method, .. }
+                        if method.receiver == MethodReceiver::Instance
+                            && method.name == *new
+                ));
+                // Wherever the association is declared: the lowering puts
+                // the copy in the reader's place either way. Not when a
+                // later `def` takes the name back: the copy is never kept.
+                let replaces_association = !redefined_later
+                    && model.body.iter().any(|item| matches!(
+                        item,
+                        ModelBodyItem::Association { assoc, .. } if assoc.name() == new
+                    ));
+                let source = if replaces_association || refused.contains(old) {
+                    None
+                } else if let Some(source) = live.get(old) {
                     Some(source.clone())
                 } else if declared_anywhere.contains(old) {
                     // Declared later in the body — not live yet, and
@@ -2279,16 +2338,23 @@ pub(crate) fn model_aliases<'m>(
                 } else {
                     inherited_forwarder(model, old).map(|_| AliasSource::Inherited(old.clone()))
                 };
-                let redefined_later = model.body[idx + 1..].iter().any(|later| matches!(
-                    later,
-                    ModelBodyItem::Method { method, .. }
-                        if method.receiver == MethodReceiver::Instance
-                            && method.name == *new
-                ));
-                if let Some(source) = &source {
-                    live.insert(new.clone(), source.clone());
+                let refusal = if replaces_association {
+                    Some(AliasRefusal::ReplacesAssociation)
+                } else if refused.contains(old) {
+                    Some(AliasRefusal::CopiesRefusedAlias)
+                } else {
+                    source.is_none().then_some(AliasRefusal::Unresolved)
+                };
+                match &source {
+                    Some(source) => {
+                        live.insert(new.clone(), source.clone());
+                    }
+                    None if refusal != Some(AliasRefusal::Unresolved) => {
+                        refused.insert(new.clone());
+                    }
+                    None => {}
                 }
-                out.push(ModelAlias { new: new.clone(), old: old.clone(), span: *span, source, redefined_later });
+                out.push(ModelAlias { new: new.clone(), old: old.clone(), span: *span, source, refusal, redefined_later });
             }
             _ => {}
         }
@@ -2419,6 +2485,13 @@ fn push_alias_target_unresolved_gap(
             model.name.0
         )
     };
+    push_alias_refused_gap(span, detail);
+}
+
+/// Refuse a model alias under the one construct every refused alias
+/// shares, so survey mode demotes it (`attribute_analysis_gaps`) and the
+/// Roda emitter leaves it out.
+fn push_alias_refused_gap(span: Span, detail: String) {
     crate::emit::diagnostics::push(crate::diagnostic::Diagnostic::unsupported(
         span,
         None,

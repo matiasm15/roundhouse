@@ -127,15 +127,17 @@ fn an_alias_of_a_method_a_parent_overrides_answers_with_the_overrides_return() {
 }
 
 #[test]
-fn an_alias_keeps_the_association_reader_a_later_alias_replaces() {
-    // `alias comments author` replaces the `comments` reader, but
-    // `saved_comments` copied the association first and `remarks` copies
-    // `saved_comments`: both stay collections on every harvest.
+fn an_alias_that_replaces_an_association_reader_leaves_the_reader() {
+    // The lowering refuses `alias comments author` (it would break the
+    // methods the association generates), so `comments` stays the
+    // collection. `saved_comments` copied the association before it, and
+    // `remarks` copies `saved_comments`. Each call names a method no
+    // receiver has, so the failures show the types themselves.
     let f = failures(
         "class Post < ApplicationRecord\n  has_many :comments\n  belongs_to :author, optional: true\n  alias saved_comments comments\n  alias comments author\n  alias remarks saved_comments\nend\n",
-        "  def show\n    post = Post.find(params[:id])\n    @remarks = post.remarks.first&.body\n    @saved = post.saved_comments.first&.body\n    @author = post.comments&.name\n  end",
+        "  def show\n    post = Post.find(params[:id])\n    @remarks = post.remarks.first&.missing_on_comment\n    @saved = post.saved_comments.first&.missing_on_comment\n    @comments = post.comments.first&.missing_on_comment\n  end",
     );
-    assert!(f.is_empty(), "{f:?}");
+    assert_eq!(f, vec!["Comment#missing_on_comment", "Comment#missing_on_comment", "Comment#missing_on_comment"]);
 }
 
 #[test]

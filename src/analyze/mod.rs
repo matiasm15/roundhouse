@@ -5831,6 +5831,7 @@ impl Analyzer {
                 None => continue,
                 Some(AliasSource::Method(method)) => {
                     let ret = self.method_return_ty(class_id, method);
+                    self.unfold_model_alias(class_id, &alias.new);
                     let target = &mut self.classes.entry(class_id.clone()).or_default().instance_methods;
                     Self::register_method_return(target, &alias.new, ret.as_ref());
                     continue;
@@ -5867,8 +5868,19 @@ impl Analyzer {
                 }
             };
             if let Some(ty) = ty {
+                self.unfold_model_alias(class_id, &alias.new);
                 self.classes.entry(class_id.clone()).or_default().instance_methods.insert(alias.new, ty);
             }
+        }
+    }
+
+    /// The alias is the model's own method, which Ruby puts ahead of an
+    /// included module's: drop `name` from the fold's copies, so
+    /// `fold_concern_surfaces` leaves the alias's entry in place even when
+    /// the fold wrote `name` on a harvest before the alias had a type.
+    fn unfold_model_alias(&mut self, class_id: &ClassId, name: &Symbol) {
+        if let Some((instance, _)) = self.concern_folded.get_mut(class_id) {
+            instance.remove(name);
         }
     }
 
