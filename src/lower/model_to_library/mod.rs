@@ -2286,6 +2286,8 @@ pub(crate) fn model_aliases<'m>(
     for (idx, item) in model.body.iter().enumerate() {
         match item {
             ModelBodyItem::Method { method, .. } if method.receiver == MethodReceiver::Instance => {
+                // A `def` defines the name again, whatever alias was refused for it above.
+                refused.remove(&method.name);
                 live.insert(method.name.clone(), AliasSource::Method(method));
             }
             ModelBodyItem::Association { assoc, .. } => {
@@ -2347,6 +2349,7 @@ pub(crate) fn model_aliases<'m>(
                 };
                 match &source {
                     Some(source) => {
+                        refused.remove(new);
                         live.insert(new.clone(), source.clone());
                     }
                     None if refusal != Some(AliasRefusal::Unresolved) => {

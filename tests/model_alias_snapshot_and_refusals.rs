@@ -217,3 +217,21 @@ fn an_alias_over_an_association_a_later_def_replaces_does_not_refuse() {
     );
     assert!(alias_unresolved_diags(&diags).is_empty(), "{diags:?}");
 }
+
+/// A name whose alias was refused, defined again below by a `def` or by
+/// an alias that resolves, is that new definition from there on: an
+/// alias of it copies it and is not refused.
+#[test]
+fn a_refused_alias_name_defined_again_can_be_copied() {
+    let (_app, lc, diags) = lower_widget(
+        "class Widget < ApplicationRecord\n  has_many :gadgets\n\n  def first_gadget\n    gadgets.first\n  end\n  alias gadgets first_gadget\n  alias parts gadgets\n\n  def parts\n    42\n  end\n  alias pieces parts\nend\n",
+    );
+    assert_eq!(alias_unresolved_diags(&diags).len(), 2, "only `gadgets` and the `parts` alias: {diags:?}");
+    assert!(lc.methods.iter().any(|m| m.name.as_str() == "pieces"), "`pieces` copies `def parts`");
+
+    let (_app, lc, diags) = lower_widget(
+        "class Widget < ApplicationRecord\n  has_many :gadgets\n\n  def first_gadget\n    gadgets.first\n  end\n  alias gadgets first_gadget\n  alias parts gadgets\n  alias parts first_gadget\n  alias pieces parts\nend\n",
+    );
+    assert_eq!(alias_unresolved_diags(&diags).len(), 2, "only `gadgets` and the first `parts` alias: {diags:?}");
+    assert!(lc.methods.iter().any(|m| m.name.as_str() == "pieces"), "`pieces` copies the second `parts` alias");
+}
