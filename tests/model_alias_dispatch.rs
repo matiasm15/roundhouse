@@ -26,12 +26,18 @@ const SCHEMA: &str = r#"ActiveRecord::Schema.define do
 end
 "#;
 
+const APPLICATION_RECORD: &str = "class ApplicationRecord < ActiveRecord::Base\n  primary_abstract_class\nend\n";
+
 /// `(receiver, method)` for each failed dispatch, after analysis.
 fn failures(post: &str, controller_body: &str) -> Vec<String> {
+    failures_with(APPLICATION_RECORD, post, controller_body)
+}
+
+fn failures_with(application_record: &str, post: &str, controller_body: &str) -> Vec<String> {
     let controller = format!("class PostsController < ApplicationController\n{controller_body}\nend\n");
     let files: Vec<(&str, &str)> = vec![
         ("db/schema.rb", SCHEMA),
-        ("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  primary_abstract_class\nend\n"),
+        ("app/models/application_record.rb", application_record),
         ("app/models/post.rb", post),
         ("app/models/comment.rb", "class Comment < ApplicationRecord\n  belongs_to :post\nend\n"),
         ("app/models/author.rb", "class Author < ApplicationRecord\nend\n"),
@@ -94,6 +100,28 @@ fn an_alias_of_an_alias_answers() {
     let f = failures(
         "class Post < ApplicationRecord\n  has_many :comments\n  alias notes comments\n  alias remarks notes\nend\n",
         "  def show\n    @first = Post.find(params[:id]).remarks.first&.body\n  end",
+    );
+    assert!(f.is_empty(), "{f:?}");
+}
+
+#[test]
+fn an_alias_of_a_method_a_parent_redefines_answers_with_the_parents() {
+    let f = failures_with(
+        "class ApplicationRecord < ActiveRecord::Base\n  primary_abstract_class\n\n  def reload\n    super\n  end\nend\n",
+        "class Post < ApplicationRecord\n  alias refresh reload\nend\n",
+        "  def show\n    @title = Post.find(params[:id]).refresh.title\n  end",
+    );
+    assert!(f.is_empty(), "{f:?}");
+}
+
+#[test]
+fn an_alias_keeps_the_association_reader_a_later_alias_replaces() {
+    // `alias comments author` replaces the `comments` reader, but
+    // `saved_comments` copied the association first and `remarks` copies
+    // `saved_comments`: both stay collections on every harvest.
+    let f = failures(
+        "class Post < ApplicationRecord\n  has_many :comments\n  belongs_to :author, optional: true\n  alias saved_comments comments\n  alias comments author\n  alias remarks saved_comments\nend\n",
+        "  def show\n    post = Post.find(params[:id])\n    @remarks = post.remarks.first&.body\n    @saved = post.saved_comments.first&.body\n    @author = post.comments&.name\n  end",
     );
     assert!(f.is_empty(), "{f:?}");
 }

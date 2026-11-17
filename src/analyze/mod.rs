@@ -856,7 +856,7 @@ impl Analyzer {
                 if entry.receiver != ReceiverContext::Instance {
                     continue;
                 }
-                let Some(kind) = entry.return_kind else { continue };
+                let Some(ret) = catalog_instance_ty(entry, &model.name) else { continue };
                 // Dispatch checks the model's own table before its includes and
                 // parent, so a seed here would hide an override that lives in
                 // an included module or a parent class (Ruby's ancestor order
@@ -876,14 +876,6 @@ impl Analyzer {
                 if inherited(entry.name) || (entry.name == "lock!" && inherited("reload")) {
                     continue;
                 }
-                // The shared runtime types `reload` and `lock!` as `() -> Base`,
-                // but in Rails they answer `self`: keep the receiver's own
-                // class so its model methods still resolve on the result.
-                let ret = if matches!(entry.name, "reload" | "lock!") {
-                    self_ty.clone()
-                } else {
-                    instantiate(kind)
-                };
                 cls.instance_methods.insert(Symbol::from(entry.name), ret);
             }
             // AR instance methods not (yet) in the catalog: dirty-tracking
@@ -5811,6 +5803,11 @@ impl Analyzer {
     /// elsewhere in the app (`@goods_in.items` over
     /// `alias items goods_in_items`) dispatches to it. An alias the
     /// lowering refuses stays unknown.
+    ///
+    /// A synthesized reader's type comes from its declaration, not from
+    /// the registry entry of its name: a later `alias comments author`
+    /// writes that entry, and an earlier `alias saved_comments comments`
+    /// still copies the association reader, on every harvest.
     fn harvest_model_aliases(&mut self, model: &Model, schema: &crate::schema::Schema) {
         use crate::lower::model_to_library::{model_aliases, AliasSource};
         let class_id = &model.name;
@@ -5822,19 +5819,31 @@ impl Analyzer {
             if alias.redefined_later {
                 continue;
             }
-            match alias.source {
-                None => {}
+            let ty = match alias.source {
+                None => continue,
                 Some(AliasSource::Method(method)) => {
                     let ret = self.method_return_ty(class_id, method);
                     let target = &mut self.classes.entry(class_id.clone()).or_default().instance_methods;
                     Self::register_method_return(target, &alias.new, ret.as_ref());
+                    continue;
                 }
-                Some(AliasSource::Synthesized(name) | AliasSource::Inherited(name)) => {
-                    let target = &mut self.classes.entry(class_id.clone()).or_default().instance_methods;
-                    if let Some(ty) = target.get(&name).cloned() {
-                        target.insert(alias.new, ty);
-                    }
-                }
+                Some(AliasSource::Synthesized { name, item }) => Some(synthesized_reader_ty(item, &name)),
+                // The copy forwards to `old` on the model itself, so it
+                // answers the model's own entry for `old`, or, where the
+                // seed left none because an app base class redefines it
+                // (`def reload; super; end`), the cataloged method on this
+                // model, as `inherited_forwarder` requires one.
+                Some(AliasSource::Inherited(name)) => self
+                    .classes
+                    .get(class_id)
+                    .and_then(|cls| cls.instance_methods.get(&name).cloned())
+                    .or_else(|| {
+                        crate::catalog::lookup(name.as_str(), crate::catalog::ReceiverContext::Instance)
+                            .and_then(|entry| catalog_instance_ty(entry, class_id))
+                    }),
+            };
+            if let Some(ty) = ty {
+                self.classes.entry(class_id.clone()).or_default().instance_methods.insert(alias.new, ty);
             }
         }
     }
@@ -8464,6 +8473,20 @@ fn descends_from_active_record(
         current = parent;
     }
     true
+}
+
+/// What a cataloged ActiveRecord instance method answers on `model`, or
+/// `None` when the catalog declares no return.
+fn catalog_instance_ty(entry: &crate::catalog::CatalogedMethod, model: &ClassId) -> Option<Ty> {
+    let kind = entry.return_kind?;
+    // The shared runtime types `reload` and `lock!` as `() -> Base`,
+    // but in Rails they answer `self`: keep the receiver's own
+    // class so its model methods still resolve on the result.
+    Some(if matches!(entry.name, "reload" | "lock!") {
+        Ty::Class { id: model.clone(), args: vec![].into() }
+    } else {
+        instantiate_return_kind(kind, model)
+    })
 }
 
 /// Instantiate a catalog [`crate::catalog::ReturnKind`] against a
@@ -11933,14 +11956,33 @@ fn register_ar_attributes(body: &[ModelBodyItem], methods: &mut HashMap<Symbol, 
             .as_ref()
             .and_then(|t| typed_store_ty(t.as_str()))
             .unwrap_or(Ty::Untyped);
-        let reader_ty =
-            if matches!(ty, Ty::Untyped) { Ty::Untyped } else { Ty::Union { variants: vec![ty.clone(), Ty::Nil].into() } };
-        methods.entry(name.clone()).or_insert(reader_ty);
+        methods.entry(name.clone()).or_insert(ar_attribute_reader_ty(&ty));
         let setter = Symbol::from(format!("{}=", name.as_str()));
         methods.entry(setter).or_insert(ty.clone());
         let predicate = Symbol::from(format!("{}?", name.as_str()));
         methods.entry(predicate).or_insert(Ty::Bool);
     }
+}
+
+/// The reader of an `attribute :name, :type`: the value or nil, or
+/// untyped when the type is not one the registry knows.
+fn ar_attribute_reader_ty(ty: &Ty) -> Ty {
+    if matches!(ty, Ty::Untyped) { Ty::Untyped } else { Ty::Union { variants: vec![ty.clone(), Ty::Nil].into() } }
+}
+
+/// The type the registry seeds for the reader `name` that `item`
+/// declares: an association's reader (`association_member_ty`), an
+/// `attribute` reader (`register_ar_attributes`) or an `attr_accessor`
+/// reader, untyped (`register_attr_accessors`).
+fn synthesized_reader_ty(item: &ModelBodyItem, name: &Symbol) -> Ty {
+    if let ModelBodyItem::Association { assoc, .. } = item {
+        return association_member_ty(assoc).1;
+    }
+    crate::lower::model_to_library::markers::attribute_api_decls(std::slice::from_ref(item))
+        .into_iter()
+        .find(|(declared, _)| declared == name)
+        .map(|(_, ty)| ar_attribute_reader_ty(&ty.as_ref().and_then(|t| typed_store_ty(t.as_str())).unwrap_or(Ty::Untyped)))
+        .unwrap_or(Ty::Untyped)
 }
 
 /// Register the flat accessors `lower::has_json` synthesizes for a

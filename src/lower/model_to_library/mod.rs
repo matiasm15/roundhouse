@@ -2122,7 +2122,7 @@ fn resolve_model_aliases(
         };
         let mut copy = match source {
             AliasSource::Method(method) => method.clone(),
-            AliasSource::Synthesized(name) => synthesized(&name).expect("model_aliases asked `synthesized`").clone(),
+            AliasSource::Synthesized { name, .. } => synthesized(&name).expect("model_aliases asked `synthesized`").clone(),
             AliasSource::Inherited(name) => inherited_forwarder(model, &name).expect("model_aliases asked `inherited_forwarder`"),
         };
         copy.name = alias.new.clone();
@@ -2154,8 +2154,10 @@ pub(crate) enum AliasSource<'m> {
     /// A hand-written `def` or enum method, as defined at the alias line.
     Method(&'m MethodDef),
     /// A name the model's synthesis defines: an association reader, an
-    /// `attr_accessor` pair or an eager `attribute`.
-    Synthesized(Symbol),
+    /// `attr_accessor` pair or an eager `attribute`. `item` is the body
+    /// item that declares it, so a reader's type comes from its
+    /// declaration whatever a later alias assigns to the same name.
+    Synthesized { name: Symbol, item: &'m crate::dialect::ModelBodyItem },
     /// An `ActiveRecord::Base` instance method the body never redefines,
     /// which the copy forwards to.
     Inherited(Symbol),
@@ -2246,14 +2248,14 @@ pub(crate) fn model_aliases<'m>(
             ModelBodyItem::Association { assoc, .. } => {
                 let name = assoc.name();
                 if synthesized(name) {
-                    live.insert(name.clone(), AliasSource::Synthesized(name.clone()));
+                    live.insert(name.clone(), AliasSource::Synthesized { name: name.clone(), item });
                 }
             }
             ModelBodyItem::Unknown { expr, .. } => {
                 let attribute = attribute_api_arg_name(expr).filter(|_| eager_attributes);
                 for name in attr_accessor_arg_names(expr).into_iter().chain(attribute) {
                     if synthesized(&name) {
-                        live.insert(name.clone(), AliasSource::Synthesized(name));
+                        live.insert(name.clone(), AliasSource::Synthesized { name, item });
                     }
                 }
             }

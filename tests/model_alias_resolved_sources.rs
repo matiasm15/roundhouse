@@ -162,3 +162,27 @@ raise "has_many alias from another class" unless first.sibling_count == 2
         );
     run.assert_passes();
 }
+
+#[test]
+fn an_alias_of_a_method_a_parent_redefines_forwards_to_the_parents() {
+    let run = widgets_app()
+        .write(
+            "app/models/application_record.rb",
+            "class ApplicationRecord < ActiveRecord::Base\n  primary_abstract_class\n\n  def reload\n    super\n  end\nend\n",
+        )
+        .write("app/models/widget.rb", "class Widget < ApplicationRecord\n  alias refresh reload\nend\n")
+        .write(
+            "app/models/gadget.rb",
+            "class Gadget < ApplicationRecord\n  belongs_to :widget, optional: true\n\n  def widget_name\n    widget.refresh.name\n  end\nend\n",
+        )
+        .run_ruby(
+            r#"
+widget = Widget.create!(name: "before")
+gadget = Gadget.create!(widget: widget)
+Widget.where(id: widget.id).update_all(name: "after")
+raise "refresh reloads" unless widget.refresh.name == "after"
+raise "refresh from another class" unless gadget.widget_name == "after"
+"#,
+        );
+    run.assert_passes();
+}
